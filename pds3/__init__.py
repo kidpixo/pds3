@@ -42,6 +42,7 @@ PDS3_DATA_TYPE_TO_DTYPE = {
     'SUN_UNSIGNED_INTEGER': '>u',
     'VAX_INTEGER': '<i',
     'VAX_UNSIGNED_INTEGER': '<u',
+    'CHARACTER': 'a',
 }
 
 class PDS3Parser():
@@ -98,7 +99,7 @@ class PDS3Parser():
         r'"[^"]+"'
         t.value = t.value[1:-1].replace('\r', '')
         return t
- 
+
     def t_REAL(self, t):
         r'[+-]?(([0-9]+\.[0-9]*)|(\.[0-9]+))([Ee][+-]?[0-9]+)?'
         t.value = float(t.value)
@@ -140,8 +141,10 @@ class PDS3Parser():
                   | POINTER '=' STRING
                   | POINTER '=' '(' STRING ',' INT ')'"""
         if len(p) == 4:
+        # The record is a 2-element tuple: (keyword, value) or (pointer, string)
             p[0] = (p[1], p[3])
         else:
+        # the record is a 2-element tuple: (pointer, (string, int))
             p[0] = (p[1], (p[4], p[6]))
 
     def p_value(self, p):
@@ -269,7 +272,7 @@ def _find_file(filename, path='.'):
     ------
     IOError
       When the file is not found.
-      
+
     """
 
     import os
@@ -303,7 +306,6 @@ def read_label(filename, debug=False):
     same name are returned as a `list` of objects.
 
     """
-
     raw_label = ''
     with open(filename, 'rb') as inf:
         while True:
@@ -313,8 +315,33 @@ def read_label(filename, debug=False):
                 break
 
     parser = PDS3Parser(debug=debug)
-    records = parser.parse(raw_label)
+    records = parser.parse(resolve_include_pointer(filename,raw_label))
     return _records2dict(records)
+
+def resolve_include_pointer(filename,raw_label):
+    """Scan the raw label string for ^STRUCTURE tags, read the file pointed and
+    substitute the ^STRUCTURE = "FILE.FMT" line with the content.
+
+    Pass the original raw label if ^STRUCTURE is not present.
+    """
+    import re
+    import os
+    # assume there is only one pointer
+    pattern = re.compile('\^STRUCTURE \= "(.*)"')
+    match = pattern.search(raw_label)
+    if match:
+        include_file_name = match.group(1)
+
+        # search in /LABEL if not found!!!
+        include_file = _find_file(include_file_name,path=os.path.dirname(filename))
+
+        include_label = ''
+        with open(include_file, 'r') as inf:
+            include_label=inf.read()
+
+        return re.sub(re.compile('(\^STRUCTURE \= ".*")'),include_label,raw_label)
+    else:
+        return raw_label
 
 def read_ascii_table(label, key, path='.'):
     """Read an ASCII table as described by the label.
@@ -359,7 +386,7 @@ def read_ascii_table(label, key, path='.'):
     def repeat(dtype, col):
         n = col.get('ITEMS', 1)
         return dtype if n == 1 else (dtype,) * n
-    
+
     for i in range(n):
         col = desc['COLUMN'][i]
         col_starts.append(col['START_BYTE'] - 1)
@@ -441,7 +468,7 @@ def read_binary_table(label, key, path='.'):
 
     Returns
     -------
-    table : 
+    table :
 
     Raises
     ------
@@ -458,20 +485,20 @@ def read_binary_table(label, key, path='.'):
     offset = np.zeros(len(desc['COLUMN']))
     scale = np.ones(len(desc['COLUMN']))
     for i, col in enumerate(desc['COLUMN']):
-        if col['START_BYTE'] != byte:
-            raise NotImplementedError("Table requires skipping bytes.")
-
-        if col['ITEMS'] != 1:
-            raise NotImplementedError("Table requires mutliple items per column.")
+        if col.get('ITEMS') is not None:
+            col_items = col['ITEMS']
+        else:
+            col_items = 1
 
         byte += col['START_BYTE']
-        x = PDS3_DATA_TYPE_TO_DTYPE[col['DATA_TYPE']] + str(col['ITEM_BYTES'])
-        dtype.append((col['NAME'], x))
+        x = PDS3_DATA_TYPE_TO_DTYPE[col['DATA_TYPE']] + str(col['ITEM_BYTES'] if col.get('ITEM_BYTES') else col['BYTES'])
+        dtype.append((col['NAME'], x, col_items))
 
         offset[i] = col.get('OFFSET', 0.0)
         scale[i] = col.get('SCALE', 1.0)
+        # print(col['NAME'], x, col_items)
 
-    if desc['ROW_BYTES'] != bytes:
+    if desc.get('ROW_BYTES') is None:
         raise NotImplementedError("Table requires skipping bytes.")
 
     dtype = np.dtype(dtype)
@@ -583,7 +610,7 @@ Start byte: {}'''.format(shape, line_size, bands, dtype, filename,
         if n != len(buf):
             raise IOError("Expected {} bytes of data, but only read {}".format(
                     n, len(buf)))
-    
+
     # remove prefix and suffix, convert to image data type and shape
     data = np.frombuffer(buf, dtype=np.uint8, count=n)
     del buf
